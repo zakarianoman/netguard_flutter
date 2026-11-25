@@ -1,14 +1,26 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../models/app_info.dart';
 import '../services/native_app_service.dart';
+import '../services/native_firewall_service.dart';
+import '../services/rule_storage_service.dart';
 
-/// Main firewall screen displaying installed apps and per-network toggles.
+/// Main firewall screen displaying master VPN control, installed apps, and per-network toggles.
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({super.key, NativeAppService? appService})
-      : _appService = appService;
+  const HomeScreen({
+    super.key,
+    NativeAppService? appService,
+    NativeFirewallService? firewallService,
+    RuleStorageService? ruleStorageService,
+  })  : _appService = appService,
+        _firewallService = firewallService,
+        _ruleStorageService = ruleStorageService;
 
   final NativeAppService? _appService;
+  final NativeFirewallService? _firewallService;
+  final RuleStorageService? _ruleStorageService;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -16,38 +28,86 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   late final NativeAppService _appService;
+  late final NativeFirewallService _firewallService;
+  late final RuleStorageService _ruleStorageService;
   final TextEditingController _searchController = TextEditingController();
+
+  StreamSubscription<FirewallStatus>? _statusSubscription;
 
   List<AppInfo> _allApps = const [];
   bool _isLoading = true;
   String? _errorMessage;
   bool _showSystemApps = false;
   String _searchQuery = '';
+  FirewallStatus _firewallStatus = FirewallStatus.initial;
+  bool _isTogglingFirewall = false;
 
   @override
   void initState() {
     super.initState();
     _appService = widget._appService ?? NativeAppService();
-    _loadApps();
+    _firewallService = widget._firewallService ?? NativeFirewallService();
+    _ruleStorageService = widget._ruleStorageService ?? RuleStorageService();
+    _subscribeToFirewallStatus();
+    _loadAppsAndStatus();
   }
 
   @override
   void dispose() {
+    _statusSubscription?.cancel();
     _searchController.dispose();
     super.dispose();
   }
 
-  Future<void> _loadApps() async {
+  void _subscribeToFirewallStatus() {
+    try {
+      _statusSubscription = _firewallService.statusStream.listen(
+        (status) {
+          if (!mounted) return;
+          setState(() {
+            _firewallStatus = status;
+          });
+        },
+        onError: (_) {
+          // Ignore stream errors on unsupported test/non-Android environments.
+        },
+      );
+    } catch (_) {
+      // Ignore if statusStream is unavailable in a stub/test environment.
+    }
+  }
+
+  Future<void> _loadAppsAndStatus() async {
     setState(() {
       _isLoading = true;
       _errorMessage = null;
     });
 
     try {
-      final apps = await _appService.getInstalledApps();
+      final results = await Future.wait([
+        _appService.getInstalledApps(),
+        _ruleStorageService.loadRules(),
+        _firewallService.getStatus(),
+      ]);
+
       if (!mounted) return;
+
+      final fetchedApps = results[0] as List<AppInfo>;
+      final savedRules = results[1] as Map<String, AppFirewallRule>;
+      final initialStatus = results[2] as FirewallStatus;
+
+      final mergedApps = fetchedApps.map((app) {
+        final rule = savedRules[app.packageName];
+        if (rule == null) return app;
+        return app.copyWith(
+          allowWifi: rule.allowWifi,
+          allowMobile: rule.allowMobile,
+        );
+      }).toList(growable: false);
+
       setState(() {
-        _allApps = apps;
+        _allApps = mergedApps;
+        _firewallStatus = initialStatus;
         _isLoading = false;
       });
     } on NativeAppServiceException catch (e) {
@@ -79,6 +139,72 @@ class _HomeScreenState extends State<HomeScreen> {
     }).toList(growable: false);
   }
 
+  List<String> get _allowedWifiPackages => _allApps
+      .where((app) => app.allowWifi)
+      .map((app) => app.packageName)
+      .toList(growable: false);
+
+  List<String> get _allowedMobilePackages => _allApps
+      .where((app) => app.allowMobile)
+      .map((app) => app.packageName)
+      .toList(growable: false);
+
+  Future<void> _toggleFirewall(bool enable) async {
+    if (_isTogglingFirewall) return;
+
+    setState(() => _isTogglingFirewall = true);
+    try {
+      if (enable) {
+        final started = await _firewallService.startFirewall(
+          allowedWifiPackages: _allowedWifiPackages,
+          allowedMobilePackages: _allowedMobilePackages,
+        );
+        if (!mounted) return;
+        if (started) {
+          setState(() {
+            _firewallStatus = FirewallStatus(
+              isActive: true,
+              networkType: _firewallStatus.networkType,
+            );
+          });
+        } else {
+          _showSnackBar('VPN permission is required to enable the firewall.');
+        }
+      } else {
+        await _firewallService.stopFirewall();
+        if (!mounted) return;
+        setState(() {
+          _firewallStatus = FirewallStatus(
+            isActive: false,
+            networkType: _firewallStatus.networkType,
+          );
+        });
+      }
+    } on NativeFirewallServiceException catch (e) {
+      if (!mounted) return;
+      _showSnackBar(e.message);
+    } finally {
+      if (mounted) {
+        setState(() => _isTogglingFirewall = false);
+      }
+    }
+  }
+
+  Future<void> _persistAndSyncRules() async {
+    try {
+      await _ruleStorageService.saveRules(_allApps);
+      if (_firewallStatus.isActive) {
+        await _firewallService.updateRules(
+          allowedWifiPackages: _allowedWifiPackages,
+          allowedMobilePackages: _allowedMobilePackages,
+        );
+      }
+    } on NativeFirewallServiceException catch (e) {
+      if (!mounted) return;
+      _showSnackBar(e.message);
+    }
+  }
+
   void _setVisibleAppsAccess(bool allow) {
     final visiblePackages =
         _visibleApps.map((app) => app.packageName).toSet();
@@ -93,6 +219,7 @@ class _HomeScreenState extends State<HomeScreen> {
           )
           .toList(growable: false);
     });
+    unawaited(_persistAndSyncRules());
   }
 
   void _toggleWifi(String packageName) {
@@ -105,6 +232,7 @@ class _HomeScreenState extends State<HomeScreen> {
           )
           .toList(growable: false);
     });
+    unawaited(_persistAndSyncRules());
   }
 
   void _toggleMobile(String packageName) {
@@ -117,6 +245,13 @@ class _HomeScreenState extends State<HomeScreen> {
           )
           .toList(growable: false);
     });
+    unawaited(_persistAndSyncRules());
+  }
+
+  void _showSnackBar(String message) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
@@ -129,7 +264,7 @@ class _HomeScreenState extends State<HomeScreen> {
         actions: [
           IconButton(
             tooltip: 'Refresh installed apps',
-            onPressed: _isLoading ? null : _loadApps,
+            onPressed: _isLoading ? null : _loadAppsAndStatus,
             icon: const Icon(Icons.refresh),
           ),
         ],
@@ -180,7 +315,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               const SizedBox(height: 16),
               FilledButton.icon(
-                onPressed: _loadApps,
+                onPressed: _loadAppsAndStatus,
                 icon: const Icon(Icons.refresh),
                 label: const Text('Retry'),
               ),
@@ -192,6 +327,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
     return Column(
       children: [
+        _buildFirewallMasterBanner(context),
         _buildTopControls(context, visibleApps),
         const Divider(height: 1),
         Expanded(
@@ -210,6 +346,95 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
         ),
       ],
+    );
+  }
+
+  Widget _buildFirewallMasterBanner(BuildContext context) {
+    final theme = Theme.of(context);
+    final colorScheme = theme.colorScheme;
+    final isActive = _firewallStatus.isActive;
+    final networkType = _firewallStatus.networkType;
+
+    final containerColor = isActive
+        ? colorScheme.primaryContainer.withOpacity(0.55)
+        : colorScheme.surfaceContainerHighest.withOpacity(0.6);
+    final accentColor =
+        isActive ? colorScheme.primary : colorScheme.onSurfaceVariant;
+
+    final IconData networkIcon;
+    switch (networkType) {
+      case FirewallNetworkType.wifi:
+        networkIcon = Icons.wifi;
+      case FirewallNetworkType.mobile:
+        networkIcon = Icons.signal_cellular_alt;
+      case FirewallNetworkType.none:
+        networkIcon = Icons.signal_wifi_off;
+    }
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        decoration: BoxDecoration(
+          color: containerColor,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: accentColor.withOpacity(0.3),
+          ),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              isActive ? Icons.shield : Icons.shield_outlined,
+              color: accentColor,
+              size: 28,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    isActive ? 'Protection Active' : 'Protection Paused',
+                    style: theme.textTheme.titleSmall?.copyWith(
+                      fontWeight: FontWeight.w600,
+                      color: isActive
+                          ? colorScheme.onPrimaryContainer
+                          : colorScheme.onSurface,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Row(
+                    children: [
+                      Icon(
+                        networkIcon,
+                        size: 14,
+                        color: accentColor,
+                      ),
+                      const SizedBox(width: 4),
+                      Flexible(
+                        child: Text(
+                          'Network: ${networkType.displayLabel}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.bodySmall?.copyWith(
+                            color: colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            Switch(
+              value: isActive,
+              onChanged: _isTogglingFirewall ? null : _toggleFirewall,
+            ),
+          ],
+        ),
+      ),
     );
   }
 
